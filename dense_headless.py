@@ -4,6 +4,7 @@ import time
 import math
 import argparse
 import os
+import csv
 
 # Set up command line arguments
 parser = argparse.ArgumentParser(description='Dense Optical Flow with global motion estimation (headless version)')
@@ -12,11 +13,33 @@ parser.add_argument('--output-dir', type=str, default='/app/output', help='Outpu
 parser.add_argument('--max-frames', type=int, default=300, help='Maximum number of frames to process (default: 300)')
 parser.add_argument('--decimation', type=int, default=5, help='Decimation factor for performance (default: 5)')
 parser.add_argument('--save-videos', action='store_true', help='Save output videos (default: only print motion data)')
+parser.add_argument('--save-reference', type=str, help='Save pan/tilt reference data to specified file (CSV format)')
+
+# Optical Flow Parameters (Farneback algorithm)
+parser.add_argument('--pyr-scale', type=float, default=0.5, help='Pyramid scale factor (default: 0.5)')
+parser.add_argument('--levels', type=int, default=2, help='Number of pyramid levels (default: 2)')
+parser.add_argument('--winsize', type=int, default=10, help='Averaging window size (default: 10)')
+parser.add_argument('--iterations', type=int, default=2, help='Number of iterations at each pyramid level (default: 2)')
+parser.add_argument('--poly-n', type=int, default=5, help='Size of pixel neighborhood for polynomial expansion (default: 5)')
+parser.add_argument('--poly-sigma', type=float, default=1.2, help='Standard deviation for Gaussian kernel (default: 1.2)')
+
+# Motion Estimation Parameters
+parser.add_argument('--grid-step', type=int, default=8, help='Grid sampling step for motion estimation (default: 8)')
+parser.add_argument('--motion-threshold', type=float, default=0.5, help='Minimum motion magnitude to consider (default: 0.5)')
+parser.add_argument('--min-points', type=int, default=10, help='Minimum points required for robust estimation (default: 10)')
+parser.add_argument('--ransac-threshold', type=float, default=2.0, help='RANSAC reprojection threshold (default: 2.0)')
+
+# Smoothing Parameters
+parser.add_argument('--smoothing-alpha', type=float, default=0.5, help='Motion smoothing factor (0-1, default: 0.5)')
+
 args = parser.parse_args()
 
 # Only create output directory if saving videos
 if args.save_videos:
     os.makedirs(args.output_dir, exist_ok=True)
+
+# Initialize reference data storage if --save-reference is specified
+reference_data = []
 
 # Decimation factor - reduce image size by this factor for better performance
 DECIMATION_FACTOR = args.decimation
@@ -81,7 +104,7 @@ if args.save_videos:
     hsv[..., 1] = 255
 
 # Create grid of points for motion estimation
-step = 8  # Sample every 8th pixel for efficiency
+step = args.grid_step  # Use configurable grid step
 y_coords, x_coords = np.mgrid[step//2:h-step//2:step, step//2:w-step//2:step]
 points1 = np.stack([x_coords.ravel(), y_coords.ravel()], axis=1).astype(np.float32)
 
@@ -95,7 +118,7 @@ fps_display = 0
 pan_x_smooth = 0
 pan_y_smooth = 0
 rotation_smooth = 0
-alpha = 0.5  # Smoothing factor
+alpha = args.smoothing_alpha  # Use configurable smoothing factor
 
 # Accumulation variables for stabilization
 accumulated_rotation = 0  # Total rotation accumulation for stabilization
@@ -116,11 +139,11 @@ def extract_global_motion(flow_field, points):
         if 0 <= x < flow_field.shape[1] and 0 <= y < flow_field.shape[0]:
             fx, fy = flow_field[y, x]
             # Only use points with significant motion
-            if np.sqrt(fx*fx + fy*fy) > 0.5:
+            if np.sqrt(fx*fx + fy*fy) > args.motion_threshold:
                 source_points.append([x, y])
                 flow_vectors.append([x + fx, y + fy])
     
-    if len(source_points) < 10:  # Need minimum points for robust estimation
+    if len(source_points) < args.min_points:  # Need minimum points for robust estimation
         return 0, 0, 0
     
     source_points = np.array(source_points, dtype=np.float32)
@@ -134,7 +157,7 @@ def extract_global_motion(flow_field, points):
     try:
         transform, mask = cv.estimateAffinePartial2D(source_points, flow_points, 
                                                     method=cv.RANSAC, 
-                                                    ransacReprojThreshold=2.0)
+                                                    ransacReprojThreshold=args.ransac_threshold)
         if transform is not None:
             # Extract rotation angle
             rotation_rad = math.atan2(transform[1, 0], transform[0, 0])
@@ -242,8 +265,10 @@ while processed_frames < args.max_frames:
     frame2_small = cv.resize(frame2, None, fx=1/DECIMATION_FACTOR, fy=1/DECIMATION_FACTOR, interpolation=cv.INTER_NEAREST)
     next = cv.cvtColor(frame2_small, cv.COLOR_BGR2GRAY)
     
-    # Optimized Farneback parameters for speed:
-    cv.calcOpticalFlowFarneback(prvs, next, flow, 0.5, 2, 10, 2, 5, 1.2, 0)
+    # Configurable Farneback parameters for optical flow:
+    cv.calcOpticalFlowFarneback(prvs, next, flow, 
+                               args.pyr_scale, args.levels, args.winsize, 
+                               args.iterations, args.poly_n, args.poly_sigma, 0)
     
     # Extract global motion parameters
     pan_x, pan_y, rotation = extract_global_motion(flow, points1)
@@ -257,6 +282,18 @@ while processed_frames < args.max_frames:
     accumulated_rotation -= rotation_smooth
     accumulated_pan_x += pan_x_smooth
     accumulated_pan_y += pan_y_smooth
+    
+    # Store reference data if --save-reference is specified
+    if args.save_reference:
+        reference_data.append([
+            processed_frames,
+            pan_x_smooth,
+            pan_y_smooth,
+            rotation_smooth,
+            accumulated_rotation,
+            accumulated_pan_x,
+            accumulated_pan_y
+        ])
     
     # Calculate FPS
     elapsed_time = time.time() - start_time
@@ -335,4 +372,23 @@ if args.save_videos:
     print(f"  - original_with_motion.mp4 (original video with motion vectors)")
     print(f"  - rotation_corrected.mp4 (rotation-stabilized video)")
 else:
-    print(f"\nTo save video outputs, use --save-videos flag") 
+    print(f"\nTo save video outputs, use --save-videos flag")
+
+# Save reference data if --save-reference is specified
+if args.save_reference:
+    with open(args.save_reference, 'w', newline='') as csvfile:
+        csvwriter = csv.writer(csvfile)
+        # Write CSV header
+        csvwriter.writerow([
+            'frame',
+            'pan_x',
+            'pan_y', 
+            'rotation_deg',
+            'accumulated_rotation_deg',
+            'accumulated_pan_x',
+            'accumulated_pan_y'
+        ])
+        # Write all collected data
+        csvwriter.writerows(reference_data)
+    print(f"\nReference data saved to {args.save_reference}")
+    print(f"Saved {len(reference_data)} frames of pan/tilt data") 
